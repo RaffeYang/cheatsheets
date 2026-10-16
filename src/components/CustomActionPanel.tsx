@@ -1,49 +1,57 @@
-import { Action, ActionPanel, Icon } from "@raycast/api"
-import * as path from "path"
-import type { Snippet } from "../types"
-import { getPastableContent } from "../utils/SnippetsLoader"
+import { Action, ActionPanel, Icon } from "@raycast/api";
+import * as path from "path";
+import type { Snippet } from "../types";
+import { getPastableContent } from "../utils/SnippetsLoader";
 
-const CustomActionPanel = ({
+type ContentProps = { snippet: Snippet; primaryAction: string; handleAction: (s: Snippet) => void };
+export function SnippetContentActions({ snippet, primaryAction, handleAction }: ContentProps) {
+  const content = getPastableContent(snippet.content.content);
+  const copy = (
+    <Action.CopyToClipboard
+      key="copy"
+      title="Copy Content"
+      content={content}
+      shortcut={{ modifiers: ["cmd"], key: "c" }}
+      onCopy={() => handleAction(snippet)}
+    />
+  );
+  const paste = (
+    <Action.Paste
+      key="paste"
+      title="Paste to Active App"
+      content={content}
+      shortcut={{ modifiers: ["cmd", "shift"], key: "p" }}
+      onPaste={() => handleAction(snippet)}
+    />
+  );
+  return <>{primaryAction === "pasteToActiveApp" ? [paste, copy] : [copy, paste]}</>;
+}
+
+export default function CustomActionPanel({
   handleAction,
   snippet,
+  primaryAction,
   reloadSnippets,
   paths,
-}: {
-  handleAction: (s: Snippet) => void
-  snippet: Snippet
-  primaryAction: string
-  reloadSnippets: () => void
-  paths: string[]
-}) => {
-  // 获取文件的完整路径
-  const getFullPath = () => {
-    const folderPath = paths[0] // 使用主文件夹
-    const relativePath = snippet.folder === "." ? snippet.name : path.join(snippet.folder, snippet.name)
-    // 添加文件扩展名（如果没有）
-    const fileExtension = path.extname(relativePath) || ".md"
-    const fullPath = path.join(folderPath, relativePath + (path.extname(relativePath) ? "" : fileExtension))
-    return fullPath
-  }
-
+  showContentActions = true,
+}: ContentProps & {
+  reloadSnippets: () => void;
+  paths: string[];
+  showContentActions?: boolean;
+}) {
   return (
     <>
       <ActionPanel.Section title="Actions">
-        <Action.ShowInFinder 
-          title="Open in Finder"
-          path={getFullPath()}
-          shortcut={{ modifiers: ["cmd"], key: "o" }}
-          onShow={() => {
-            handleAction(snippet)
-          }}
-        />
-        <Action.CopyToClipboard
-          title="Copy Content"
-          content={getPastableContent(snippet.content?.content)}
-          shortcut={{ modifiers: ["cmd"], key: "c" }}
-          onCopy={() => {
-            handleAction(snippet)
-          }}
-        />
+        {showContentActions && (
+          <SnippetContentActions snippet={snippet} primaryAction={primaryAction} handleAction={handleAction} />
+        )}
+        {snippet.fullPath && (
+          <Action.ShowInFinder
+            title="Open in Finder"
+            path={snippet.fullPath}
+            shortcut={{ modifiers: ["cmd"], key: "o" }}
+          />
+        )}
       </ActionPanel.Section>
       <ActionPanel.Section title="Others">
         <Action
@@ -52,26 +60,16 @@ const CustomActionPanel = ({
           onAction={reloadSnippets}
           shortcut={{ modifiers: ["cmd"], key: "r" }}
         />
-        {paths && paths.length > 0 && (
+        {paths.map((folder, index) => (
           <Action.OpenWith
-            title="Open Primary Snippets Folder"
-            path={paths[0]}
-            shortcut={{ modifiers: ["cmd", "shift"], key: "o" }}
+            key={folder}
+            title={
+              index === 0 ? "Open Primary Snippets Folder" : `Open Secondary Snippets Folder ${path.basename(folder)}`
+            }
+            path={folder}
           />
-        )}
-        {paths && paths.length > 1 && paths.slice(1).map((p, index) => {
-          const lastDir = path.basename(p)
-          return (
-            <Action.OpenWith 
-              key={`secondary-folder-${index}`}
-              title={`Open Secondary Snippets Folder ${lastDir}`} 
-              path={p} 
-            />
-          )
-        })}
+        ))}
       </ActionPanel.Section>
     </>
-  )
+  );
 }
-
-export default CustomActionPanel

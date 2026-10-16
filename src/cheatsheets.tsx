@@ -1,94 +1,215 @@
-import { Action, ActionPanel, clearSearchBar, getPreferenceValues, Icon, List, showToast, Toast } from "@raycast/api"
-import { useEffect, useState } from "react"
-import CustomActionPanel from "./components/CustomActionPanel"
-import type { Snippet, State } from "./types"
-import { clearUnusedSnippets, orderSnippets, storeLastCopied } from "./utils/LocalStorageHelper"
-import { expandHomeDirectory, loadAllSnippets } from "./utils/SnippetsLoader"
+import { clearSearchBar, Action, ActionPanel, getPreferenceValues, Icon, List, showToast, Toast } from "@raycast/api";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { adaptMarkdownForDisplay } from "./utils/MarkdownCompatibility";
+import { searchSnippets } from "./utils/SnippetSearch";
+import CustomActionPanel, { SnippetContentActions } from "./components/CustomActionPanel";
+import { extractHeadings, extractSectionContent } from "./utils/DocumentHeadings";
+import type { Snippet, State, Heading } from "./types";
+import {
+  clearUnusedSnippets,
+  orderSnippets,
+  storeLastCopied,
+  loadReaderState,
+  saveReaderState,
+  type ReaderState,
+} from "./utils/LocalStorageHelper";
+import { expandHomeDirectory, loadAllSnippets } from "./utils/SnippetsLoader";
 
-// Heading type definition
-interface Heading {
-  level: number
-  text: string
-  startIndex: number
-  endIndex: number
-  id: string // 唯一ID字段
-}
+const headingCache = new WeakMap<Snippet, Heading[]>();
 
 export default function Command() {
-  const [state, setState] = useState<State>({ snippets: [], isLoading: true })
-  const [selectedSnippet, setSelectedSnippet] = useState<Snippet | null>(null)
-  const [headings, setHeadings] = useState<Heading[]>([])
-  const [selectedHeading, setSelectedHeading] = useState<Heading | null>(null)
+  const [state, setState] = useState<State>({ snippets: [], isLoading: true });
+  const [selectedSnippet, setSelectedSnippet] = useState<Snippet | null>(null);
+  const [headings, setHeadings] = useState<Heading[]>([]);
+  const [selectedHeading, setSelectedHeading] = useState<Heading | null>(null);
+
+  const [searchText, setSearchText] = useState("");
+  const [activeSnippetId, setActiveSnippetId] = useState<string | null>(null);
+  const [headingSearchText, setHeadingSearchText] = useState("");
+
+  const [readerState, setReaderState] = useState<ReaderState>({ favorites: [], bookmarks: {}, reading: {} });
+  const readerRef = useRef(readerState);
+  const readerDirty = useRef(false);
+  const readerTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const loadGeneration = useRef(0);
+  const persistReader = (next: ReaderState, immediate = false) => {
+    readerRef.current = next;
+    readerDirty.current = true;
+    setReaderState(next);
+    clearTimeout(readerTimer.current);
+    const save = () => {
+      void saveReaderState(readerRef.current).catch((error) => console.error("Reader state save failed", error));
+    };
+    if (immediate) save();
+    else readerTimer.current = setTimeout(save, 400);
+  };
+  useEffect(
+    () => () => {
+      clearTimeout(readerTimer.current);
+      if (readerDirty.current) void saveReaderState(readerRef.current).catch(console.error);
+    },
+    [],
+  );
+  const rememberHeading = (heading: Heading, query: string) => {
+    if (!selectedSnippet) return;
+    const current = readerRef.current;
+    persistReader({
+      ...current,
+      reading: { ...current.reading, [selectedSnippet.id]: { headingId: heading.id, headingSearch: query } },
+    });
+  };
+  const toggleFavorite = (snippet: Snippet) => {
+    const current = readerRef.current;
+    persistReader(
+      {
+        ...current,
+        favorites: current.favorites.includes(snippet.id)
+          ? current.favorites.filter((id) => id !== snippet.id)
+          : [...current.favorites, snippet.id],
+      },
+      true,
+    );
+  };
+  const toggleBookmark = (heading: Heading) => {
+    if (!selectedSnippet) return;
+    const current = readerRef.current;
+    const bookmarks = current.bookmarks[selectedSnippet.id] ?? [];
+    persistReader(
+      {
+        ...current,
+        bookmarks: {
+          ...current.bookmarks,
+          [selectedSnippet.id]: bookmarks.includes(heading.id)
+            ? bookmarks.filter((id) => id !== heading.id)
+            : [...bookmarks, heading.id],
+        },
+      },
+      true,
+    );
+  };
+
+  const clearCurrentSearch = () => {
+    void clearSearchBar({ forceScrollToTop: false }).catch(console.error);
+    if (selectedSnippet) {
+      setHeadingSearchText("");
+      if (selectedHeading) rememberHeading(selectedHeading, "");
+    } else setSearchText("");
+  };
 
   const handleAction = async function (snippet: Snippet) {
-    await storeLastCopied(snippet)
+    clearCurrentSearch();
+    const sourceSnippets = state.snippets;
+    const sourceFiltered = state.filteredSnippets;
+    const sourceFilter = state.selectedFilter;
+    const generation = loadGeneration.current;
+    try {
+      await storeLastCopied(snippet);
 
-    const orderedSnippets = await orderSnippets(state.snippets ?? [])
-    const filteredSnippets = await orderSnippets(state.filteredSnippets ?? state.snippets ?? [])
-    setState((previous) => ({ ...previous, snippets: orderedSnippets, filteredSnippets: filteredSnippets }))
-  }
+      const orderedSnippets = await orderSnippets(state.snippets ?? []);
+      const filteredSnippets = await orderSnippets(state.filteredSnippets ?? state.snippets ?? []);
+      setState((previous) => {
+        if (
+          generation !== loadGeneration.current ||
+          previous.snippets !== sourceSnippets ||
+          previous.filteredSnippets !== sourceFiltered ||
+          previous.selectedFilter !== sourceFilter
+        )
+          return previous;
+        return { ...previous, snippets: orderedSnippets, filteredSnippets };
+      });
+    } catch (error) {
+      console.error("History save failed", error);
+    }
+  };
 
-  // 修改 setSelectedSnippet 函数，在选择 snippet 时清空搜索框
+  // Prepare the detail page before navigation; never render an empty intermediate page.
   const handleSelectSnippet = async (snippet: Snippet) => {
-    setSelectedSnippet(snippet)
-    // 添加延迟和错误处理
-    setTimeout(async () => {
-      try {
-        await clearSearchBar()
-      } catch (error) {
-        console.error("Failed to clear search bar:", error)
-      }
-    }, 100)
-  }
+    // Tinycast retains native search independently of the controlled List props.
+    await clearSearchBar({ forceScrollToTop: false });
+    let extractedHeadings = headingCache.get(snippet);
+    if (!extractedHeadings) {
+      extractedHeadings = extractHeadings(snippet.content.content);
+      headingCache.set(snippet, extractedHeadings);
+    }
+    const savedReading = readerRef.current.reading[snippet.id];
+    const firstSection =
+      extractedHeadings.find((heading) => heading.id === savedReading?.headingId) ??
+      extractedHeadings.find(
+        (heading, index) => !extractedHeadings[index + 1] || extractedHeadings[index + 1].level <= heading.level,
+      ) ??
+      extractedHeadings[0] ??
+      null;
+    if (firstSection) {
+      const current = readerRef.current;
+      persistReader({
+        ...current,
+        reading: {
+          ...current.reading,
+          [snippet.id]: { headingId: firstSection.id, headingSearch: "" },
+        },
+      });
+    }
+    setHeadings(extractedHeadings);
+    setSelectedHeading(firstSection);
+    setHeadingSearchText("");
+    setActiveSnippetId(snippet.id);
+    setSearchText("");
+    setSelectedSnippet(snippet);
+  };
 
   // 返回到 snippets 列表
   const handleBackToSnippets = () => {
-    setSelectedSnippet(null)
-  }
-
-  // Fetch primary action preference
-  useEffect(() => {
-    const fetch = async () => {
-      const preferences = getPreferenceValues()
-      const primaryAction = preferences["primaryAction"]
-      setState((previous) => ({ ...previous, primaryAction: primaryAction }))
-    }
-    fetch()
-  }, [])
+    clearCurrentSearch();
+    clearTimeout(readerTimer.current);
+    if (readerDirty.current) void saveReaderState(readerRef.current).catch(console.error);
+    setSelectedSnippet(null);
+  };
 
   // Initial data fetch
   const fetchData = async () => {
+    const generation = ++loadGeneration.current;
+    setState((previous) => ({ ...previous, isLoading: true }));
     try {
-      const preferences = getPreferenceValues()
-      const path = preferences["folderPath"]
+      const savedReader = await loadReaderState();
+      if (!readerDirty.current) {
+        readerRef.current = savedReader;
+        setReaderState(savedReader);
+      }
+      const preferences = getPreferenceValues();
+      const path = preferences["folderPath"];
       const allPathsTmp = preferences["secondaryFolderPaths"]
         ? [path, ...preferences["secondaryFolderPaths"].split(",")]
-        : [path]
-      const allPaths = Array.from(new Set(allPathsTmp.map(expandHomeDirectory)))
+        : [path];
+      const allPaths = Array.from(
+        new Set(allPathsTmp.map((folder: string) => expandHomeDirectory(folder.trim())).filter(Boolean)),
+      );
 
-      const snippetsPromises = allPaths.map(loadAllSnippets)
-      const snippetsArrays = await Promise.all(snippetsPromises)
-      const snippets = snippetsArrays.flatMap(({ snippets }) => snippets)
-      const errors = snippetsArrays.flatMap(({ errors }) => errors)
+      const snippetsPromises = allPaths.map(loadAllSnippets);
+      const snippetsArrays = await Promise.all(snippetsPromises);
+      const snippets = Array.from(
+        new Map(snippetsArrays.flatMap(({ snippets }) => snippets).map((snippet) => [snippet.id, snippet])).values(),
+      );
+      const errors = snippetsArrays.flatMap(({ errors }) => errors);
 
       const folders = Array.from(
         new Set(
           snippets.map((i) => {
-            return i.folder
-          })
-        )
-      )
+            return i.folder;
+          }),
+        ),
+      );
 
       const tags = Array.from(
         new Set(
           snippets.flatMap((i) => {
-            return i.content.tags ?? []
-          })
-        )
-      )
+            return i.content.tags ?? [];
+          }),
+        ),
+      );
 
-      await clearUnusedSnippets(snippets)
-      const orderedSnippets = await orderSnippets(snippets)
+      await clearUnusedSnippets(snippets);
+      const orderedSnippets = await orderSnippets(snippets);
+      if (generation !== loadGeneration.current) return;
 
       setState((previous) => ({
         ...previous,
@@ -98,93 +219,100 @@ export default function Command() {
         tags: tags,
         paths: allPaths,
         errors: errors,
-      }))
+        primaryAction: preferences["primaryAction"],
+      }));
     } catch (err) {
+      if (generation !== loadGeneration.current) return;
       setState((previous) => ({
         ...previous,
         errors: [err instanceof Error ? err : new Error("Something went wrong")],
-      }))
+      }));
     }
 
-    setState((previous) => ({ ...previous, isLoading: false }))
-  }
+    if (generation === loadGeneration.current) setState((previous) => ({ ...previous, isLoading: false }));
+  };
   useEffect(() => {
-    fetchData()
-  }, [])
+    fetchData();
+  }, []);
 
   // Handle filter folder
+  // Use the latest state, including asynchronously loaded snippets.
   useEffect(() => {
-    if (state.selectedFilter && state.selectedFilter != "all") {
-      const handleFilterByFolder = (snippet: Snippet, filterValue: string) => {
-        return snippet.folder == filterValue
-      }
-      const handleFilterByTags = (snippet: Snippet, filterValue: string) => {
-        return snippet.content.tags?.includes(filterValue)
+    setState((previous) => {
+      const filter = previous.selectedFilter;
+      const snippets = previous.snippets ?? [];
+      let filteredSnippets = snippets;
+
+      if (filter?.startsWith("folder:")) {
+        filteredSnippets = snippets.filter((snippet) => snippet.folder === filter.substring(7));
+      } else if (filter?.startsWith("tag:")) {
+        filteredSnippets = snippets.filter((snippet) => snippet.content.tags?.includes(filter.substring(4)));
       }
 
-      if (state.snippets) {
-        // 修改函数签名，使用 eslint-disable-next-line 来忽略未使用参数的警告
-        // eslint-disable-next-line @typescript-eslint/no-unused-vars
-        let handleFilterMethod = (snippet: Snippet) => true
-        if (state.selectedFilter.startsWith("folder:")) {
-          const filterValue = state.selectedFilter.substring("folder:".length)
-          handleFilterMethod = (snippet: Snippet) => {
-            return handleFilterByFolder(snippet, filterValue)
-          }
-        } else if (state.selectedFilter.startsWith("tag:")) {
-          const filterValue = state.selectedFilter.substring("tag:".length)
-          handleFilterMethod = (snippet: Snippet) => {
-            return handleFilterByTags(snippet, filterValue)
-          }
-        }
+      return { ...previous, filteredSnippets };
+    });
+  }, [state.selectedFilter, state.snippets]);
 
-        const res = state.snippets.filter(handleFilterMethod)
-        setState((previous) => ({ ...previous, filteredSnippets: res }))
-      }
-    } else {
-      setState((previous) => ({ ...previous, filteredSnippets: state.snippets }))
-    }
-  }, [state.selectedFilter])
+  // Extract headings before switching pages, rather than in a deferred effect.
 
-  // Extract headings when a snippet is selected
+  const visibleSnippets = useMemo(
+    () =>
+      searchSnippets(
+        state.selectedFilter === "favorites"
+          ? (state.snippets ?? []).filter((snippet) => readerState.favorites.includes(snippet.id))
+          : (state.filteredSnippets ?? []),
+        searchText,
+      ),
+    [state.filteredSnippets, state.snippets, state.selectedFilter, searchText, readerState.favorites],
+  );
+  const activeSnippet = visibleSnippets.find((snippet) => snippet.id === activeSnippetId) ?? visibleSnippets[0];
+  const activeHeading = selectedHeading ?? headings[0];
+  const selectedSectionContent = useMemo(
+    () =>
+      selectedSnippet && activeHeading ? extractSectionContent(selectedSnippet.content.content, activeHeading) : "",
+    [selectedSnippet, activeHeading],
+  );
+
+  // Parent headings preview their own introduction, not every descendant section.
+  const selectedSectionMarkdown = useMemo(
+    () =>
+      selectedSnippet && activeHeading
+        ? adaptMarkdownForDisplay(extractSectionContent(selectedSnippet.content.content, activeHeading, true))
+        : "",
+    [selectedSnippet, activeHeading],
+  );
+
   useEffect(() => {
-    if (selectedSnippet) {
-      const extractedHeadings = extractHeadings(selectedSnippet.content.content)
-      setHeadings(extractedHeadings)
-      
-      // Select the first heading by default
-      if (extractedHeadings.length > 0) {
-        setSelectedHeading(extractedHeadings[0])
-      } else {
-        setSelectedHeading(null)
-      }
-    } else {
-      setHeadings([])
-      setSelectedHeading(null)
-    }
-  }, [selectedSnippet])
-
-  if (state.errors && state.errors.length != 0) {
-    const options: Toast.Options = {
-      style: Toast.Style.Failure,
-      title: "Error loading snippets.",
-      message: state.errors?.map((e) => e.message).join("\n"),
-    }
-    showToast(options)
-  }
+    if (state.errors?.length)
+      void showToast({
+        style: Toast.Style.Failure,
+        title: "Some documents could not be loaded",
+        message: state.errors.slice(0, 5).map(String).join("\n"),
+      }).catch(console.error);
+  }, [state.errors]);
 
   // If a snippet is selected, show the headings list with detail
   if (selectedSnippet) {
     return (
       <List
+        key="headings"
         navigationTitle={selectedSnippet.name}
+        searchText={headingSearchText}
+        onSearchTextChange={(query) => {
+          setHeadingSearchText(query);
+          if (activeHeading) rememberHeading(activeHeading, query);
+        }}
+        filtering={true}
+        throttle={false}
+        selectedItemId={activeHeading?.id}
         searchBarPlaceholder="Search headings..."
         isShowingDetail
         onSelectionChange={(id) => {
           if (id) {
-            const heading = headings.find((h) => h.id === id)
-            if (heading) {
-              setSelectedHeading(heading)
+            const heading = headings.find((h) => h.id === id);
+            if (heading && heading.id !== activeHeading?.id) {
+              setSelectedHeading(heading);
+              rememberHeading(heading, headingSearchText);
             }
           }
         }}
@@ -201,9 +329,7 @@ export default function Command() {
             description="This document doesn't contain any headings."
             actions={
               <ActionPanel>
-                <Action title="Back to Snippets" icon={Icon.ArrowLeft} 
-                  onAction={handleBackToSnippets}
-                />
+                <Action title="Back to Snippets" icon={Icon.ArrowLeft} onAction={handleBackToSnippets} />
                 <Action.CopyToClipboard
                   title="Copy Content"
                   content={selectedSnippet.content.content}
@@ -223,76 +349,134 @@ export default function Command() {
               key={heading.id} // 使用唯一ID作为key
               id={heading.id} // 使用唯一ID作为id，而不是text
               title={heading.text}
-              icon={heading.level === 1 ? Icon.Heading : heading.level === 2 ? Icon.Dot : Icon.Circle}
-              accessories={[{ text: heading.level === 1 ? "H1" : heading.level === 2 ? "H2" : "H3" }]}
+              icon={Icon.Circle}
+              accessories={[
+                ...(readerState.bookmarks[selectedSnippet.id]?.includes(heading.id)
+                  ? [{ icon: Icon.Bookmark, tooltip: "Bookmarked section" }]
+                  : []),
+                { text: "H" + heading.level },
+              ]}
               detail={
-                <List.Item.Detail
-                  markdown={
-                    selectedHeading
-                      ? extractSectionContent(selectedSnippet.content.content, selectedHeading)
-                      : selectedSnippet.content.content
-                  }
-                  metadata={
-                    selectedSnippet.content.tags && selectedSnippet.content.tags.length > 0 ? (
-                      <List.Item.Detail.Metadata>
-                        <List.Item.Detail.Metadata.TagList title="Tags">
-                          {selectedSnippet.content.tags.map((tag, tagIndex) => (
-                            <List.Item.Detail.Metadata.TagList.Item text={tag} key={`tag-${tag}-${tagIndex}`} />
-                          ))}
-                        </List.Item.Detail.Metadata.TagList>
-                      </List.Item.Detail.Metadata>
-                    ) : null
-                  }
-                />
+                activeHeading?.id === heading.id ? (
+                  <List.Item.Detail
+                    markdown={selectedSectionMarkdown}
+                    metadata={
+                      selectedSnippet.content.tags && selectedSnippet.content.tags.length > 0 ? (
+                        <List.Item.Detail.Metadata>
+                          <List.Item.Detail.Metadata.TagList title="Tags">
+                            {selectedSnippet.content.tags.map((tag, tagIndex) => (
+                              <List.Item.Detail.Metadata.TagList.Item text={tag} key={`tag-${tag}-${tagIndex}`} />
+                            ))}
+                          </List.Item.Detail.Metadata.TagList>
+                        </List.Item.Detail.Metadata>
+                      ) : null
+                    }
+                  />
+                ) : undefined
               }
               actions={
-                <ActionPanel>
-                  <Action title="Back to Snippets" icon={Icon.ArrowLeft} onAction={handleBackToSnippets} />
-                  <Action.CopyToClipboard
-                    title="Copy Section"
-                    content={extractSectionContent(selectedSnippet.content.content, heading)}
-                    shortcut={{ modifiers: ["cmd"], key: "c" }}
-                  />
-                  <Action.CopyToClipboard
-                    title="Copy Full Content"
-                    content={selectedSnippet.content.content}
-                    shortcut={{ modifiers: ["cmd", "shift"], key: "c" }}
-                  />
-                </ActionPanel>
+                activeHeading?.id === heading.id ? (
+                  <ActionPanel>
+                    <Action title="Back to Snippets" icon={Icon.ArrowLeft} onAction={handleBackToSnippets} />
+                    <Action
+                      title={
+                        readerState.bookmarks[selectedSnippet.id]?.includes(heading.id)
+                          ? "Remove Section Bookmark"
+                          : "Bookmark Section"
+                      }
+                      icon={Icon.Bookmark}
+                      onAction={() => toggleBookmark(heading)}
+                    />
+                    <Action
+                      title={
+                        readerState.favorites.includes(selectedSnippet.id) ? "Unfavorite Document" : "Favorite Document"
+                      }
+                      icon={Icon.Star}
+                      onAction={() => toggleFavorite(selectedSnippet)}
+                    />
+                    {(readerState.bookmarks[selectedSnippet.id] ?? []).length > 0 && (
+                      <ActionPanel.Section title="Bookmarked Sections">
+                        {headings
+                          .filter((item) => readerState.bookmarks[selectedSnippet.id]?.includes(item.id))
+                          .map((item) => (
+                            <Action
+                              key={item.id}
+                              title={item.text}
+                              icon={Icon.Bookmark}
+                              onAction={() => {
+                                setHeadingSearchText("");
+                                setSelectedHeading(item);
+                                rememberHeading(item, "");
+                              }}
+                            />
+                          ))}
+                      </ActionPanel.Section>
+                    )}
+                    {state.primaryAction === "pasteToActiveApp" && (
+                      <Action.Paste
+                        title="Paste Section to Active App"
+                        content={selectedSectionContent}
+                        shortcut={{ modifiers: ["cmd", "shift"], key: "p" }}
+                        onPaste={() => handleAction(selectedSnippet)}
+                      />
+                    )}
+                    <Action.CopyToClipboard
+                      title="Copy Section"
+                      onCopy={() => handleAction(selectedSnippet)}
+                      content={selectedSectionContent}
+                      shortcut={{ modifiers: ["cmd"], key: "c" }}
+                    />
+                    <Action.CopyToClipboard
+                      title="Copy Full Content"
+                      onCopy={() => handleAction(selectedSnippet)}
+                      content={selectedSnippet.content.content}
+                      shortcut={{ modifiers: ["cmd", "shift"], key: "c" }}
+                    />
+                  </ActionPanel>
+                ) : undefined
               }
             />
           ))
         )}
       </List>
-    )
+    );
   }
 
   // Main snippets list
-  const loadSnippetsView = state.filteredSnippets && state.filteredSnippets.length != 0
+  const loadSnippetsView = visibleSnippets.length > 0;
   return (
     <List
+      key="snippets"
       searchBarPlaceholder="Type to search snippets"
+      filtering={false}
+      throttle={false}
+      searchText={searchText}
+      onSearchTextChange={setSearchText}
+      onSelectionChange={setActiveSnippetId}
+      selectedItemId={activeSnippet?.id ?? null}
       isLoading={state.isLoading}
       searchBarAccessory={
         <List.Dropdown
+          value={state.selectedFilter ?? "all"}
           tooltip="Filter on folder"
           storeValue={true}
           onChange={(newValue) => {
-            setState((previous) => ({ ...previous, selectedFilter: newValue }))
+            setState((previous) => ({ ...previous, selectedFilter: newValue }));
           }}
         >
           <List.Dropdown.Item title="All" value="all" />
+          <List.Dropdown.Item title="Favorites" value="favorites" />
           {state.folders && state.folders.length != 1 && (
             <List.Dropdown.Section title="Folders">
               {state.folders.map((i, index) => {
-                return <List.Dropdown.Item title={i} value={`folder:${i}`} key={`folder-${i}-${index}`} />
+                return <List.Dropdown.Item title={i} value={`folder:${i}`} key={`folder-${i}-${index}`} />;
               })}
             </List.Dropdown.Section>
           )}
           {state.tags && state.tags.length != 0 && (
             <List.Dropdown.Section title="Tags">
               {state.tags.map((i, index) => {
-                return <List.Dropdown.Item title={i} value={`tag:${i}`} key={`tag-${i}-${index}`} />
+                return <List.Dropdown.Item title={i} value={`tag:${i}`} key={`tag-${i}-${index}`} />;
               })}
             </List.Dropdown.Section>
           )}
@@ -319,105 +503,54 @@ export default function Command() {
         />
       )}
       {loadSnippetsView &&
-        state.filteredSnippets?.map((i) => {
+        visibleSnippets.map((i) => {
           return (
             <List.Item
               id={i.id}
               key={i.id}
               title={i.name}
-              accessories={[{ icon: Icon.Folder, text: i.folder && i.folder !== "." ? i.folder : "" }]}
-              keywords={[i.folder, ...i.content.content.split(" ").concat(i.content.rawMetadata.split(" "))]}
+              accessories={[
+                ...(readerState.favorites.includes(i.id) ? [{ icon: Icon.Star, tooltip: "Favorite" }] : []),
+                ...(readerState.reading[i.id] ? [{ icon: Icon.Bookmark, tooltip: "Continue reading" }] : []),
+                { icon: Icon.Folder, text: i.folder && i.folder !== "." ? i.folder : "" },
+              ]}
               icon={Icon.Document}
               actions={
                 <ActionPanel>
-                  <Action 
-                    title="Open" 
-                    icon={Icon.Eye} 
+                  {activeSnippet?.id === i.id && !!state.primaryAction && (
+                    <SnippetContentActions
+                      snippet={i}
+                      primaryAction={state.primaryAction}
+                      handleAction={handleAction}
+                    />
+                  )}
+                  <Action
+                    title="Open"
+                    icon={Icon.Eye}
                     onAction={() => handleSelectSnippet(i)} // 使用新的处理函数
                   />
-                  <CustomActionPanel
-                    handleAction={handleAction}
-                    snippet={i}
-                    primaryAction={state.primaryAction ?? ""}
-                    reloadSnippets={fetchData}
-                    paths={state.paths ?? []}
-                  />
+                  {activeSnippet?.id === i.id && (
+                    <Action
+                      title={readerState.favorites.includes(i.id) ? "Unfavorite Document" : "Favorite Document"}
+                      icon={Icon.Star}
+                      onAction={() => toggleFavorite(i)}
+                    />
+                  )}
+                  {activeSnippet?.id === i.id && (
+                    <CustomActionPanel
+                      handleAction={handleAction}
+                      snippet={i}
+                      primaryAction={state.primaryAction ?? ""}
+                      reloadSnippets={fetchData}
+                      paths={state.paths ?? []}
+                      showContentActions={!state.primaryAction}
+                    />
+                  )}
                 </ActionPanel>
               }
             />
-          )
+          );
         })}
     </List>
-  )
-}
-
-// Function to extract headings from markdown content
-function extractHeadings(content: string): Heading[] {
-  // Only match headings at the beginning of a line, and ignore code blocks
-  const headingRegex = /^(#{1,3})\s+(.+)$/gm
-  const codeBlockRegex = /```[\s\S]*?```/g
-  
-  // Replace code blocks with placeholders to avoid matching headings inside code blocks
-  const codeBlocks: string[] = []
-  const contentWithoutCodeBlocks = content.replace(codeBlockRegex, (match) => {
-    codeBlocks.push(match)
-    return `CODE_BLOCK_${codeBlocks.length - 1}`
-  })
-  
-  const headings: Heading[] = []
-  let match
-  let headingId = 0 // 添加计数器用于生成唯一ID
-
-  // Find all headings in the content without code blocks
-  while ((match = headingRegex.exec(contentWithoutCodeBlocks)) !== null) {
-    const level = match[1].length
-    const text = match[2].trim()
-    
-    if (text.startsWith('!')) {
-      continue
-    }
-    
-    const startIndex = match.index
-    
-    headings.push({
-      level,
-      text,
-      startIndex,
-      endIndex: content.length, // Default end is end of content, will update below
-      id: `heading-${level}-${headingId++}` // 添加唯一ID，只使用level和递增的ID，不使用text
-    })
-  }
-
-  // Calculate end index for each heading (start of next heading or end of content)
-  for (let i = 0; i < headings.length - 1; i++) {
-    headings[i].endIndex = headings[i + 1].startIndex
-  }
-
-  return headings
-}
-
-// Function to extract section content for a heading
-function extractSectionContent(content: string, heading: Heading): string {
-  // Find the heading in the original content
-  const headingRegex = new RegExp(`^${heading.level === 1 ? '#' : heading.level === 2 ? '##' : '###'}\\s+${escapeRegExp(heading.text)}`, 'm')
-  const match = headingRegex.exec(content)
-  
-  if (!match) {
-    return `# ${heading.text}\n\nSection not found.`
-  }
-  
-  const startIndex = match.index
-  
-  // Find the next heading of same or higher level
-  const nextHeadingRegex = new RegExp(`^#{1,${heading.level}}\\s+`, 'm')
-  const remainingContent = content.substring(startIndex + match[0].length)
-  const nextHeadingMatch = nextHeadingRegex.exec(remainingContent)
-  
-  // Return the heading and its content
-  return `${match[0]}\n\n${remainingContent.substring(0, nextHeadingMatch ? nextHeadingMatch.index : remainingContent.length).trim()}`
-}
-
-// Helper function to escape special characters in regular expressions
-function escapeRegExp(string: string): string {
-  return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  );
 }

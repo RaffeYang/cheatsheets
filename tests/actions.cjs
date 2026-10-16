@@ -1,0 +1,25 @@
+const fs = require('node:fs');
+const vm = require('node:vm');
+const ts = require('typescript');
+const assert = require('node:assert/strict');
+const component = name => Object.assign(function () {}, { testName: name });
+const Action = component('Action');
+for (const name of ['CopyToClipboard','Paste','ShowInFinder','OpenWith']) Action[name] = component(name);
+const exportsObject = {};
+const jsx = (type, props) => ({ type, props });
+vm.runInNewContext(ts.transpile(fs.readFileSync('src/components/CustomActionPanel.tsx','utf8'), { module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX }), { exports: exportsObject, require: id => {
+  if (id === 'react/jsx-runtime') return { jsx, jsxs: jsx };
+  if (id === '@raycast/api') return { Action, ActionPanel: { Section: component('Section') }, Icon: {} };
+  if (id === 'path') return require('node:path');
+  return { getPastableContent: text => text };
+}});
+const snippet = { name: 'Custom display name', fullPath: '/secondary/frameworks/Next.js.md', content: { content: 'raw text' } };
+let recorded;
+const props = { snippet, handleAction: value => { recorded = value; }, primaryAction:'pasteToActiveApp', paths:['/primary','/secondary'], reloadSnippets:()=>{} };
+const paste = exportsObject.SnippetContentActions(props).props.children;
+assert.equal(paste[0].type.testName,'Paste'); paste[0].props.onPaste(); assert.equal(recorded,snippet);
+assert.equal(exportsObject.SnippetContentActions({...props,primaryAction:'copyClipboard'}).props.children[0].type.testName,'CopyToClipboard');
+const panel = exportsObject.default(props);
+const finder = panel.props.children[0].props.children.find(child => child?.type?.testName === 'ShowInFinder');
+assert.equal(finder.props.path, snippet.fullPath);
+console.log('PASS: actual secondary file path and copy/paste preference action order');
